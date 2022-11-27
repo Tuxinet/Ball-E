@@ -25,6 +25,8 @@ import discord
 from discord.ext import commands
 import asyncio
 
+from concurrent.futures import ThreadPoolExecutor
+
 import uuid
 
 
@@ -134,7 +136,7 @@ parser.add_argument(
 parser.add_argument(
     "--ddim_steps",
     type=int,
-    default=50,
+    default=45,
     help="number of ddim sampling steps",
 )
 parser.add_argument(
@@ -167,13 +169,13 @@ parser.add_argument(
 parser.add_argument(
     "--H",
     type=int,
-    default=384,
+    default=512,
     help="image height, in pixel space",
 )
 parser.add_argument(
     "--W",
     type=int,
-    default=384,
+    default=512,
     help="image width, in pixel space",
 )
 parser.add_argument(
@@ -203,7 +205,7 @@ parser.add_argument(
 parser.add_argument(
     "--scale",
     type=float,
-    default=7.5,
+    default=9,
     help="unconditional guidance scale: eps = eps(x, empty) + scale * (eps(x, cond) - eps(x, empty))",
 )
 parser.add_argument(
@@ -248,8 +250,8 @@ model = model.half()
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 model = model.to(device)
 
-sampler = PLMSSampler(model)
-
+#sampler = PLMSSampler(model)
+sampler = DDIMSampler(model)
 
 
 opt = parser.parse_args()
@@ -279,9 +281,71 @@ async def on_message(message):
         await message.channel.send('Hello!')
 
 
+def gen_image(ctx, prompt, num_images, num_iter):
+    global running_ai
+    data = [batch_size * [prompt]]
+
+
+    try:
+        precision_scope = autocast
+        with torch.no_grad():
+            with precision_scope("cuda"), \
+            model.ema_scope():
+                with model.ema_scope():
+                    tic = time.time()
+                    all_samples = list()
+                    for n in trange(num_images, desc="Sampling"):
+                        for prompts in tqdm(data, desc="data"):
+                            uc = None
+                            if opt.scale != 1.0:
+                                uc = model.get_learned_conditioning(batch_size * [""])
+                            if isinstance(prompts, tuple):
+                                prompts = list(prompts)
+                            c = model.get_learned_conditioning(prompts)
+                            shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
+                            samples_ddim, _ = sampler.sample(S=num_iter,
+                                                            conditioning=c,
+                                                            batch_size=1,
+                                                            shape=shape,
+                                                            verbose=False,
+                                                            unconditional_guidance_scale=opt.scale,
+                                                            unconditional_conditioning=uc,
+                                                            eta=opt.ddim_eta,
+                                                            x_T=start_code)
+
+                            x_samples_ddim = model.decode_first_stage(samples_ddim)
+                            x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
+
+                            #x_checked_image, has_nsfw_concept = check_safety(x_samples_ddim)
+                            x_checked_image = x_samples_ddim
+
+                            x_checked_image_torch = torch.from_numpy(x_checked_image).permute(0, 3, 1, 2)
+
+                            if not opt.skip_save:
+                                for x_sample in x_checked_image_torch:
+                                    unique_id = uuid.uuid4()
+                                    x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
+                                    img = Image.fromarray(x_sample.astype(np.uint8))
+                                    img.save(os.path.join("/tmp/", f"{unique_id}.png"))
+
+                                    # Send image
+                                    
+                                    return "/tmp/{}.png".format(unique_id)
+
+                                    #base_count += 1
+
+                            if not opt.skip_grid:
+                                all_samples.append(x_checked_image_torch)
+    except:
+        # We crashed, free the mutex
+        running_ai = False
+
+
 @client.command(name="image")
 async def image(ctx, arg, num_images=1, num_iter=opt.ddim_steps):
     global running_ai
+
+    print("{} requested {} image(s) with prompt: \"{}\"".format(ctx.message.author.mention, num_images, arg))
 
     if running_ai:
         await ctx.reply("Another task is currently running, request has been queued...")
@@ -290,8 +354,7 @@ async def image(ctx, arg, num_images=1, num_iter=opt.ddim_steps):
 
     running_ai = True
 
-    unique_id = uuid.uuid4()
-    print ("Generating image with id: {}".format(uuid))
+
     await ctx.reply("Generating image with prompt: \"{}\"".format(arg))
 
     if num_images <= 0:
@@ -300,65 +363,43 @@ async def image(ctx, arg, num_images=1, num_iter=opt.ddim_steps):
 
     if num_images > 5:
         num_images = 5
-        ctx.reply("num_images threshold is 5")
+        await ctx.reply("num_images threshold is 5")
 
+    if num_iter > 100:
+        num_iter = 100
+        await ctx.reply("Maximum number of iterations is 100")
+
+
+    unique_id = uuid.uuid4()
+    print ("Generating image with id: {}".format(uuid))
 
     prompt = arg
     assert prompt is not None
-    data = [batch_size * [prompt]]
+    loop = asyncio.get_event_loop()
 
-    precision_scope = autocast
-    with torch.no_grad():
-        with precision_scope("cuda"):
-            with model.ema_scope():
-                tic = time.time()
-                all_samples = list()
-                for n in trange(num_images, desc="Sampling"):
-                    await asyncio.sleep(1)
-                    for prompts in tqdm(data, desc="data"):
-                        uc = None
-                        if opt.scale != 1.0:
-                            uc = model.get_learned_conditioning(batch_size * [""])
-                        if isinstance(prompts, tuple):
-                            prompts = list(prompts)
-                        c = model.get_learned_conditioning(prompts)
-                        shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
-                        samples_ddim, _ = sampler.sample(S=num_iter,
-                                                         conditioning=c,
-                                                         batch_size=1,
-                                                         shape=shape,
-                                                         verbose=False,
-                                                         unconditional_guidance_scale=opt.scale,
-                                                         unconditional_conditioning=uc,
-                                                         eta=opt.ddim_eta,
-                                                         x_T=start_code)
+    for _ in range(num_images):
 
-                        x_samples_ddim = model.decode_first_stage(samples_ddim)
-                        x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
-                        x_samples_ddim = x_samples_ddim.cpu().permute(0, 2, 3, 1).numpy()
+        try:
 
-                        #x_checked_image, has_nsfw_concept = check_safety(x_samples_ddim)
-                        x_checked_image = x_samples_ddim
+            image_path = await loop.run_in_executor(ThreadPoolExecutor(), gen_image, ctx, prompt, 1, num_iter)
 
-                        x_checked_image_torch = torch.from_numpy(x_checked_image).permute(0, 3, 1, 2)
+        except:
+            running_ai = False
+            await ctx.reply("Something went wrong, aborting...")
+            return
 
-                        if not opt.skip_save:
-                            for x_sample in x_checked_image_torch:
-                                unique_id = uuid.uuid4()
-                                x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
-                                img = Image.fromarray(x_sample.astype(np.uint8))
-                                img.save(os.path.join("/tmp/", f"{unique_id}.png"))
+        with open(image_path, "rb") as f:
+            try:
+                picture = discord.File(f)
+                await ctx.reply(file=picture)
+            except:
+                print("Something went wrong, releasing mutex")
+                running_ai = False
 
-                                # Send image
-                                with open("/tmp/{}.png".format(unique_id), "rb") as f:
-                                    picture = discord.File(f)
-                                    await ctx.reply(file=picture)
-                                #base_count += 1
 
-                        if not opt.skip_grid:
-                            all_samples.append(x_checked_image_torch)
 
-    print("image path: /tmp/{}.png".format(uuid))
+    #gen_image(ctx, prompt, num_images, num_iter)
+
     running_ai = False
 
     # Reply with the generated image
