@@ -187,9 +187,6 @@ parser.add_argument(
 running_ai = False
 running_text = False
 
-
-opt = parser.parse_args()
-
 from accelerate import infer_auto_device_map, init_empty_weights
 from transformers import AutoConfig, StoppingCriteria, StoppingCriteriaList
 
@@ -208,9 +205,11 @@ from exllamav2 import(
     ExLlamaV2Config,
     ExLlamaV2Cache,
     ExLlamaV2Tokenizer,
+    model_init,
 )
 
 from exllamav2.generator import (
+    ExLlamaV2StreamingGenerator,
     ExLlamaV2BaseGenerator,
     ExLlamaV2Sampler
 )
@@ -219,25 +218,24 @@ import time
 
 # Initialize model and cache
 
+model_init.add_args(parser)
+opt = parser.parse_args()
+model_init.check_args(opt)
+model_init.print_options(opt)
+model, tokenizer = model_init.init(opt)
+
 model_directory =  "/home/tuxinet/git/Llama2-13B-4.0bpw-h6-exl2/"
-#model_directory = "/home/tuxinet/models/chimera-inst-chat-13b-gptq-4bit/"
+model_directory = "/home/tuxinet/models/chimera-inst-chat-13b-gptq-4bit/"
 model_directory = "/home/tuxinet/models/Wizard-Vicuna-13B-Uncensored-GPTQ/"
+model_directory = "/home/tuxinet/models/CodeLlama-13B-instruct-2.65bpw-h6-exl2/"
 
-config = ExLlamaV2Config()
-config.model_dir = model_directory
-config.prepare()
-
-model = ExLlamaV2(config)
-print("Loading model: " + model_directory)
-model.load([8, 6])
-
-tokenizer = ExLlamaV2Tokenizer(config)
+max_response_length = 512 # tokens
 
 cache = ExLlamaV2Cache(model)
 
 # Initialize generator
 
-generator = ExLlamaV2BaseGenerator(model, cache, tokenizer)
+generator = ExLlamaV2StreamingGenerator(model, cache, tokenizer)
 
 # Generate some text
 
@@ -246,7 +244,10 @@ settings.temperature = 0.85
 settings.top_k = 50
 settings.top_p = 0.8
 settings.token_repetition_penalty = 1.15
-settings.disallow_tokens(tokenizer, [tokenizer.eos_token_id])
+#settings.disallow_tokens(tokenizer, [tokenizer.eos_token_id])
+
+generator.set_stop_conditions(["[INST]", tokenizer.eos_token_id])
+#generator.set_stop_conditions(["[INST]"])
 
 generator.warmup()
 
@@ -327,14 +328,14 @@ async def on_message(message):
 
 ## Here is a conversation between humans and {0}. Every line in the chatlog starts with their name, even if they are part of the same message.
 ---
-Ball-E: Hello, my name is Ball-E.
-Tuxinet: Hello there, can you list your capabilities?
-{0}: Some capabilities of mine include (but are not limited to):
-{0}:  - Jokes, quotes, news, weather updates, trivia, and more;
-{0}:  - Generating answers from online references and external sources.
-{0}:  - Capable of speaking multiple languages.
-Tuxinet: Wow, that's awesome!
-{0}: That is correct. What would you like for me to do?
+Hello, my name is Ball-E.
+[INST] Tuxinet: Hello there, can you list your capabilities? [/INST]
+Some capabilities of mine include (but are not limited to):
+  - Jokes, quotes, news, weather updates, trivia, and more;
+  - Generating answers from online references and external sources.
+  - Capable of speaking multiple languages.
+[INST] Tuxinet: Wow, that's awesome! [/INST]
+That is correct. What would you like for me to do?
 ---
 
 ## Here is another conversation between humans and {0}.
@@ -347,15 +348,29 @@ Tuxinet: Wow, that's awesome!
     """
     prompt = seed
     #prompt = "Ball-E is a sexually frustrated, right-winged extremist asshole\n---"
+
+    messages = []
     async for m in message.channel.history(limit=100, oldest_first=True, around=datetime.datetime.now()):
+        msg_fmt = ""
         if m.author != client.user:
             if m.content.startswith("---") and len(m.content) < 4:
                 #print ("Reset prompt to seed...")
                 prompt = seed
+                messages = ["\n"]
+                continue
             else: #husk m.author.name
-                prompt += "\n{}: {}".format(m.author.name, m.content)
+                msg_fmt = "\n[INST] {}: {} [/INST]".format(m.author.name, m.content)
         else:
-            prompt += "\n{}: {}".format(m.author.name, m.content)
+            msg_fmt = "\n{}".format(m.content)
+        
+        messages.append(msg_fmt)
+    
+    # newline for balle
+    messages.append("\n")
+
+    input_ids, p = get_tokenized_context(prompt, reversed(messages), 2048 - max_response_length + 128)
+
+    prompt = p
 
 
     if running_text:
@@ -377,7 +392,7 @@ Tuxinet: Wow, that's awesome!
                 
                 try:
                     while len(reply) == 0:
-                        reply = await loop.run_in_executor(ThreadPoolExecutor(), gen_text_bloom_chat, prompt, name)
+                        reply = await loop.run_in_executor(ThreadPoolExecutor(), gen_text_bloom_chat, prompt, input_ids, name)
                     running_text = False
                 except Exception as e:
                     # We crashed, free the mutex
@@ -388,19 +403,15 @@ Tuxinet: Wow, that's awesome!
                 if reply is None:
                     reply = "lol"
 
-                print (prompt)
-                print ("="*20)
-                print (reply)
-                
+                #print (prompt)
+                #print ("="*20)
+                #print (reply)
+
+                combined_reply = ""
                 for line in reply:
-                    if len(line) == 0:
-                        continue
-                    split_length = 1700
-
-                    chunks = [reply[i:i+split_length] for i in range(0, len(reply), split_length)]
-
-                    for text in chunks:
-                        await message.channel.send(line)
+                    combined_reply += line + "\n"
+                
+                await message.channel.send(combined_reply)
 
 #                    await message.channel.send(line)
 
@@ -412,7 +423,7 @@ Tuxinet: Wow, that's awesome!
                 
                 try:
                     while len(reply) == 0:
-                        reply = await loop.run_in_executor(ThreadPoolExecutor(), gen_text_bloom_chat, prompt, name)
+                        reply = await loop.run_in_executor(ThreadPoolExecutor(), gen_text_bloom_chat, prompt, input_ids, name)
                     running_text = False
                 except Exception as e:
                     await message.channel.send("Something went wrong...")
@@ -423,16 +434,11 @@ Tuxinet: Wow, that's awesome!
                     reply = "lol"
                 
 
+                combined_reply = ""
                 for line in reply:
-                    if len(line) == 0:
-                        continue
-
-                    split_length = 1700
-
-                    chunks = [reply[i:i+split_length] for i in range(0, len(reply), split_length)]
-
-                    for text in chunks:
-                        await message.channel.send(line)
+                    combined_reply += line + "\n"
+                
+                await message.channel.send(combined_reply)
 
 #                    await message.channel.send(line)
 
@@ -441,6 +447,30 @@ Tuxinet: Wow, that's awesome!
         print(e)
 
     running_text = False
+
+def get_tokenized_context(prompt, messages, max_len):
+    chat = []
+
+    chat_str = None
+    input_ids = None
+    for msg in messages:
+        #print(msg)
+        chat.insert(0, msg)
+
+        # Now construct the prompt
+        chat_str = prompt
+        for item in chat:
+            chat_str += item
+
+            input_ids = tokenizer.encode(chat_str)
+
+            if input_ids.shape[-1] < max_len:
+                continue
+            else:
+                return input_ids, chat_str
+    
+    return input_ids, chat_str
+
 
 
 def gen_image(ctx, prompt, num_images, num_iter):
@@ -509,10 +539,10 @@ def gen_text_gpt(ctx, prompt, max_length):
 def gen_text_gpt_chat(prompt):
     global text_generator
 
-    prompt += "\nBall-E:"
+    prompt += "\n"
 
 
-    replies = text_generator(prompt, do_sample=True, top_k=50, top_p=0.95, max_new_tokens=150, return_full_text=False, num_return_sequences=1, repetition_penalty=1.05)[0]["generated_text"].split("\n")
+    replies = text_generator(prompt, do_sample=True, top_k=50, top_p=0.95, max_new_tokens=500, return_full_text=False, num_return_sequences=1, repetition_penalty=1.05)[0]["generated_text"].split("\n")
 
     #print (replies)
     num_replies = min(len(replies), 5)
@@ -522,36 +552,50 @@ def gen_text_gpt_chat(prompt):
     for i in range(num_replies):
         if i == 0:
             reply += replies[i] + "\n"
-        elif replies[i].startswith("Ball-E"):
+        elif not replies[i].startswith("[INST]"):
             reply += replies[i] + "\n"
         else:
-            return reply.replace("Ball-E:", "").split("\n")
+            return reply.split("\n")
 
     return reply.replace("Ball-E:", "")
 
 
-def gen_text_bloom_chat(prompt, name):
+def gen_text_bloom_chat(prompt, input_ids, name):
     global text_generator
+    print (prompt)
 
-    prompt += "\n{}:".format(name)
+    prompt += "\n"
     num_lines_prompt = len(prompt.split("\n")) - 1  # Prompt ends with Ball-E:, so we have to do a minus one to include if balle just does one answer
     
-    # We want to keep on generating until the last line does not start with Ball-E
+    # We want to keep on generating until the last line starts with [INST]
     current_pointer = num_lines_prompt + 2
 
-    max_tokens = 500
-    tokens_per_iter = 10
+    max_tokens = max_response_length
+    tokens_per_iter = 5
     replies = None
+    last_replies = None
+    generated_tokens = 0
 
-    #input_ids = bloom_tokenizer(prompt, return_tensors="pt")["input_ids"].cuda()
-    #replies = bloom_tokenizer.decode(bloom_model.generate(
-    #    input_ids, 
-    #    max_new_tokens=500, 
-    #    temperature=0.7, 
-    #    do_sample=True, 
-    #    stopping_criteria=StoppingCriteriaList([StopOnTokens()]))[0], skip_special_tokens=True)
 
-    #return replies
+    generator.begin_stream(input_ids, settings)
+
+    reply = [""]
+
+    while True:
+        chunk, eos, _ = generator.stream()
+        generated_tokens += 1
+
+        reply[0] += chunk
+        print (chunk, end="")
+        sys.stdout.flush()
+
+        if eos or generated_tokens == max_tokens: break
+
+    input_token_length = input_ids.shape[-1]
+    
+    print ("\n\nInput-tokens was {} tokens, reply is {} tokens".format(input_token_length, generated_tokens))
+
+    return reply
 
     for i in range(max_tokens//tokens_per_iter):
         #continue
@@ -567,6 +611,9 @@ def gen_text_bloom_chat(prompt, name):
         #                    repetition_penalty=1.05)[0])
 
         replies = generator.generate_simple(prompt, settings, tokens_per_iter)
+        if replies == last_replies:
+            break
+        
 
         prompt = replies
         replies = replies.split("\n")
@@ -575,22 +622,25 @@ def gen_text_bloom_chat(prompt, name):
             print (line)
 #        print ("===={}".format(replies[num_lines_prompt]))
         if len(replies) > current_pointer:
-            if replies[-1].startswith("Ball-E:"):
+            if not replies[-1].startswith("[INST]"):
                 current_pointer += 1
             else:
                 break
 
-    num_replies = min(len(replies)  - num_lines_prompt, 5)
+        if replies[-1].startswith("[INST]"):
+            break
+
+    num_replies = min(len(replies)  - num_lines_prompt, 10)
 
     reply = []
 
     for i in range(num_replies):
         if i == 0:
             #reply += replies[num_lines_prompt + i - 1] + "\n"
-            reply.append(replies[num_lines_prompt + i].replace("{}:".format(name), ""))
-        elif replies[num_lines_prompt + i].startswith("{}".format(name)):
+            reply.append(replies[num_lines_prompt + i])
+        elif not replies[num_lines_prompt + i].startswith("[INST]"):
             #reply += replies[num_lines_prompt + i - 1] + "\n"
-            reply.append(replies[num_lines_prompt + i].replace("{}:".format(name), ""))
+            reply.append(replies[num_lines_prompt + i])
         else:
             print(reply)
             return reply
