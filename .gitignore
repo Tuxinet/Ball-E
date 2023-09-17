@@ -114,6 +114,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+venv_exllama/
 
 # Spyder project settings
 .spyderproject

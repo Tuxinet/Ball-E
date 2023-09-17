@@ -1,6 +1,5 @@
 #from diffusers import StableDiffusionPipeline, EulerDiscreteScheduler, StableDiffusionUpscalePipeline
 import torch
-from accelerate import init_empty_weights
 #import intel_extension_for_pytorch as ipex
 import argparse, os, sys, glob
 import numpy as np
@@ -191,10 +190,6 @@ running_text = False
 
 opt = parser.parse_args()
 
-#BACKUP_USED_FOR_MANY_YEARS
-#bloom_model = GPTJForCausalLM.from_pretrained("EleutherAI/gpt-j-6B", revision="float16", torch_dtype=torch.bfloat16, load_in_8bit=True, device_map='auto')
-#bloom_tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-j-6B")
-
 from accelerate import infer_auto_device_map, init_empty_weights
 from transformers import AutoConfig, StoppingCriteria, StoppingCriteriaList
 
@@ -205,15 +200,55 @@ model_name = "decapoda-research/llama-7b-hf"
 model_name = "meta-llama/Llama-2-7b-hf"
 #model_name = "StabilityAI/stablelm-tuned-alpha-7b"
 
-config = AutoConfig.from_pretrained(model_name, use_auth_token='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')
-device_map = None
-model = None
-with init_empty_weights():
-    model = AutoModelForCausalLM.from_config(config)
+import sys, os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-device_map = infer_auto_device_map(model, dtype="float16", max_memory={0:"8Gib", 1:"6Gib", "cpu":"16Gib"}, no_split_module_classes=["LlamaDecoderLayer"])
+from exllamav2 import(
+    ExLlamaV2,
+    ExLlamaV2Config,
+    ExLlamaV2Cache,
+    ExLlamaV2Tokenizer,
+)
 
-print (device_map)
+from exllamav2.generator import (
+    ExLlamaV2BaseGenerator,
+    ExLlamaV2Sampler
+)
+
+import time
+
+# Initialize model and cache
+
+model_directory =  "/home/tuxinet/git/Llama2-13B-4.0bpw-h6-exl2/"
+#model_directory = "/home/tuxinet/models/chimera-inst-chat-13b-gptq-4bit/"
+model_directory = "/home/tuxinet/models/Wizard-Vicuna-13B-Uncensored-GPTQ/"
+
+config = ExLlamaV2Config()
+config.model_dir = model_directory
+config.prepare()
+
+model = ExLlamaV2(config)
+print("Loading model: " + model_directory)
+model.load([8, 6])
+
+tokenizer = ExLlamaV2Tokenizer(config)
+
+cache = ExLlamaV2Cache(model)
+
+# Initialize generator
+
+generator = ExLlamaV2BaseGenerator(model, cache, tokenizer)
+
+# Generate some text
+
+settings = ExLlamaV2Sampler.Settings()
+settings.temperature = 0.85
+settings.top_k = 50
+settings.top_p = 0.8
+settings.token_repetition_penalty = 1.15
+settings.disallow_tokens(tokenizer, [tokenizer.eos_token_id])
+
+generator.warmup()
 
 #device_map['model.decoder.layers.9'] = "cpu"
 #device_map['model.decoder.layers.10'] = "cpu"
@@ -221,76 +256,6 @@ print (device_map)
 
 #quantization_config = BitsAndBytesConfig(llm_int8_enable_fp32_cpu_offload=True)
 
-bloom_model = AutoModelForCausalLM.from_pretrained(model_name, device_map=device_map, offload_folder="offload", offload_state_dict = True, torch_dtype=torch.float16, load_in_8bit=False, use_auth_token='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')#, quantization_config=quantization_config)
-bloom_tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast = False, use_auth_token='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')
-
-#device_map = infer_auto_device_map(bloom_model, no_split_module_classes=["OPTDecoderLayer"], dtype="float16")
-
-#print (device_map)
-
-sd_model_id = "stabilityai/stable-diffusion-2-base"
-
-# Use the Euler scheduler here instead
-#scheduler = EulerDiscreteScheduler.from_pretrained(sd_model_id, subfolder="scheduler")
-#sd_pipe = StableDiffusionPipeline.from_pretrained(sd_model_id, scheduler=scheduler, revision="fp16", torch_dtype=torch.float16, use_auth_token="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", load_in_8bit=True, device_map='auto')
-#sd_pipe = StableDiffusionPipeline.from_pretrained(sd_model_id, scheduler=scheduler)
-#sd_pipe = sd_pipe.to("cuda")
-
-#text_generator = pipeline('text-generation', model='EleutherAI/gpt-neo-2.7B')
-
-#bloom_model = AutoModelForCausalLM.from_pretrained('bigscience/bloom-7b1', torch_dtype=torch.bfloat16, load_in_8bit=True, device_map='auto')
-#bloom_tokenizer = AutoTokenizer.from_pretrained('bigscience/bloom-7b1')
-
-# BIG BOI GPT
-#bloom_model = GPTJForCausalLM.from_pretrained("EleutherAI/gpt-j-6B", revision="float16", torch_dtype=torch.bfloat16, load_in_8bit=True, device_map='auto')
-#bloom_tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-j-6B")
-#text_generator = pipeline('text-generation', model=bloom_model, tokenizer=bloom_tokenizer)
-
-
-#bloom_tokenizer = AutoTokenizer.from_pretrained("KoboldAI/GPT-Neo-2.7B-Shinen")
-#bloom_model = GPTJForCausalLM.from_pretrained("EleutherAI/gpt-j-6B", revision="float16", torch_dtype=torch.bfloat16, load_in_8bit=True, device_map='auto')
-#text_generator = pipeline('text-generation', model='KoboldAI/GPT-Neo-2.7B-Shinen')
-
-#gpt_model = GPTNeoXForCausalLM.from_pretrained("EleutherAI/gpt-neox-20b").half().cuda()
-#gpt_tokenizer = GPTNeoXTokenizerFast.from_pretrained("EleutherAI/gpt-neox-20b")
-
-#gpt_model = GPTJForCausalLM.from_pretrained("EleutherAI/gpt-j-6B", revision="float16", torch_dtype=torch.bfloat16, load_in_8bit=True, device_map='auto')
-#gpt_tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-j-6B")
-
-#gpt_model = GPTJForCausalLM.from_pretrained("NbAiLab/nb-gpt-j-6B", revision="float16", torch_dtype=torch.bfloat16, load_in_8bit=True, device_map='auto')
-#gpt_tokenizer = AutoTokenizer.from_pretrained("NbAiLab/nb-gpt-j-6B")
-
-#print ("Saving model")
-
-#torch.save(gpt_model, "/home/tuxinet/gptj.pt")
-
-#print ("Saved model")
-
-#exit(0)
-
-#gpt_model = torch.load("/home/tuxinet/gptj.pt")
-
-###############REACTIVATE ME IF GPT########################
-#text_generator = pipeline('text-generation', model=gpt_model, tokenizer=gpt_tokenizer)
-
-#tokenizer = AutoTokenizer.from_pretrained("bigscience/bloom-1b1")
-#model = AutoModelForCausalLM.from_pretrained("bigscience/bloom-1b1", torch_dtype=torch.bfloat16)
-
-#model = model.half()
-
-#prompt = "hanelo"
-#image = sd_pipe(prompt).images[0]
-
-#del sd_pipe
-
-#sd_pipe.enable_attention_slicing()
-
-
-upscaler_model_id = "stabilityai/stable-diffusion-x4-upscaler"
-#up_pipe = StableDiffusionUpscalePipeline.from_pretrained(upscaler_model_id, revision="fp16", torch_dtype=torch.float16)
-#up_pipe = up_pipe.to("cuda")
-
-#up_pipe.enable_attention_slicing()
 
 TOKEN = opt.token
 
@@ -535,16 +500,7 @@ def gen_image(ctx, prompt, num_images, num_iter):
 def gen_text_gpt(ctx, prompt, max_length):
     global text_generator
 
-    #return text_generator(prompt, do_sample=True, top_k=50, top_p=0.95,  max_new_tokens=max_length)[0]["generated_text"]
-
-    input_ids = bloom_tokenizer(prompt, return_tensors="pt")["input_ids"].cuda()
-
-    replies = bloom_tokenizer.decode(bloom_model.generate(input_ids,
-                            do_sample=True,
-                            top_k=50,
-                            top_p=0.95,
-                            max_new_tokens=max_length,
-                            repetition_penalty=1.05)[0])
+    replies = generator.generate_simple(prompt, settings, max_length)
 
     return replies
 
@@ -600,15 +556,18 @@ def gen_text_bloom_chat(prompt, name):
     for i in range(max_tokens//tokens_per_iter):
         #continue
 #       print ("loop")
-        input_ids = bloom_tokenizer(prompt, return_tensors="pt")["input_ids"].cuda()
+        #input_ids = bloom_tokenizer(prompt, return_tensors="pt")["input_ids"].cuda()
 
-        replies = bloom_tokenizer.decode(bloom_model.generate(input_ids,
-                            do_sample=True,
-                            top_k=50,
-                            top_p=0.95,
-                            max_new_tokens=tokens_per_iter,
-                            early_stopping=True,
-                            repetition_penalty=1.05)[0])
+        #replies = bloom_tokenizer.decode(bloom_model.generate(input_ids,
+        #                    do_sample=True,
+        #                    top_k=50,
+        #                    top_p=0.95,
+        #                    max_new_tokens=tokens_per_iter,
+        #                    early_stopping=True,
+        #                    repetition_penalty=1.05)[0])
+
+        replies = generator.generate_simple(prompt, settings, tokens_per_iter)
+
         prompt = replies
         replies = replies.split("\n")
 
