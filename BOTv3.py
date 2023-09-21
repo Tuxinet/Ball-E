@@ -184,6 +184,12 @@ parser.add_argument(
     default="autocast"
 )
 
+parser.add_argument(
+    "--max-tokens",
+    type=int,
+    default=2048,
+    help="The max number of context-tokens for a given llm-model"
+)
 running_ai = False
 running_text = False
 
@@ -246,7 +252,7 @@ settings.top_p = 0.8
 settings.token_repetition_penalty = 1.15
 #settings.disallow_tokens(tokenizer, [tokenizer.eos_token_id])
 
-generator.set_stop_conditions(["[INST]", tokenizer.eos_token_id])
+generator.set_stop_conditions(["[INST]", "[/INST]", "[REPLY]", "[/REPLY]", tokenizer.eos_token_id])
 #generator.set_stop_conditions(["[INST]"])
 
 generator.warmup()
@@ -356,7 +362,7 @@ That is correct. What would you like for me to do?
             if m.content.startswith("---") and len(m.content) < 4:
                 #print ("Reset prompt to seed...")
                 prompt = seed
-                messages = ["\n"]
+                messages = []
                 continue
             else: #husk m.author.name
                 msg_fmt = "\n[INST] {}: {} [/INST]".format(m.author.name, m.content)
@@ -365,10 +371,8 @@ That is correct. What would you like for me to do?
         
         messages.append(msg_fmt)
     
-    # newline for balle
-    messages.append("\n")
 
-    input_ids, p = get_tokenized_context(prompt, reversed(messages), 2048 - max_response_length + 128)
+    input_ids, p = get_tokenized_context(prompt, reversed(messages), opt.max_tokens - max_response_length - 128)
 
     prompt = p
 
@@ -391,8 +395,11 @@ That is correct. What would you like for me to do?
                 loop = asyncio.get_event_loop()
                 
                 try:
-                    while len(reply) == 0:
+                    # Sometimes it just generates whitespace
+                    while len(reply.strip()) == 0:
                         reply = await loop.run_in_executor(ThreadPoolExecutor(), gen_text_bloom_chat, prompt, input_ids, name)
+                        print (f"Length of reply is: {len(reply)} characters.")
+                        seed_everything(np.random.randint(10000))
                     running_text = False
                 except Exception as e:
                     # We crashed, free the mutex
@@ -407,11 +414,14 @@ That is correct. What would you like for me to do?
                 #print ("="*20)
                 #print (reply)
 
-                combined_reply = ""
-                for line in reply:
-                    combined_reply += line + "\n"
+#                combined_reply = ""
+#                for line in reply:
+#                    combined_reply += line + "\n"
                 
-                await message.channel.send(combined_reply)
+                replies = [reply[i:i+1800] for i in range(0, len(reply), 1800)]
+                
+                for r in replies:
+                    await message.channel.send(r)
 
 #                    await message.channel.send(line)
 
@@ -422,8 +432,10 @@ That is correct. What would you like for me to do?
                 loop = asyncio.get_event_loop()
                 
                 try:
-                    while len(reply) == 0:
+                    while len(reply.strip()) == 0:
                         reply = await loop.run_in_executor(ThreadPoolExecutor(), gen_text_bloom_chat, prompt, input_ids, name)
+                        seed_everything(np.random.randint(10000))
+                        print (f"Length of reply is: {len(reply)} characters.")
                     running_text = False
                 except Exception as e:
                     await message.channel.send("Something went wrong...")
@@ -434,11 +446,14 @@ That is correct. What would you like for me to do?
                     reply = "lol"
                 
 
-                combined_reply = ""
-                for line in reply:
-                    combined_reply += line + "\n"
+#                combined_reply = ""
+#                for line in reply:
+#                    combined_reply += line + "\n"
+
+                replies = [reply[i:i+1800] for i in range(0, len(reply), 1800)]
                 
-                await message.channel.send(combined_reply)
+                for r in replies:
+                    await message.channel.send(r)
 
 #                    await message.channel.send(line)
 
@@ -449,6 +464,8 @@ That is correct. What would you like for me to do?
     running_text = False
 
 def get_tokenized_context(prompt, messages, max_len):
+    # Has to have a newline to not crash with the prompt
+    #prompt += "\n"
     chat = []
 
     chat_str = None
@@ -458,6 +475,7 @@ def get_tokenized_context(prompt, messages, max_len):
         chat.insert(0, msg)
 
         # Now construct the prompt
+
         chat_str = prompt
         for item in chat:
             chat_str += item
@@ -467,7 +485,20 @@ def get_tokenized_context(prompt, messages, max_len):
             if input_ids.shape[-1] < max_len:
                 continue
             else:
+                chat_str += "\n"
+                input_ids = tokenizer.encode(chat_str)
                 return input_ids, chat_str
+    
+    # Construct final result
+    chat_str = prompt
+    for item in chat:
+        chat_str += item
+
+    chat_str += "\n"
+    
+    input_ids = tokenizer.encode(chat_str)
+
+    #print(chat_str)
     
     return input_ids, chat_str
 
@@ -562,9 +593,8 @@ def gen_text_gpt_chat(prompt):
 
 def gen_text_bloom_chat(prompt, input_ids, name):
     global text_generator
-    print (prompt)
+    #print (prompt)
 
-    prompt += "\n"
     num_lines_prompt = len(prompt.split("\n")) - 1  # Prompt ends with Ball-E:, so we have to do a minus one to include if balle just does one answer
     
     # We want to keep on generating until the last line starts with [INST]
@@ -593,9 +623,11 @@ def gen_text_bloom_chat(prompt, input_ids, name):
 
     input_token_length = input_ids.shape[-1]
     
-    print ("\n\nInput-tokens was {} tokens, reply is {} tokens".format(input_token_length, generated_tokens))
+    print ("\n\nInput tokens was {} tokens, reply is {} tokens".format(input_token_length, generated_tokens))
 
-    return reply
+    #print (prompt + reply)
+
+    return reply[0]
 
     for i in range(max_tokens//tokens_per_iter):
         #continue
