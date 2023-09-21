@@ -566,31 +566,6 @@ def gen_text_gpt(ctx, prompt, max_length):
     return replies
 
 
-
-def gen_text_gpt_chat(prompt):
-    global text_generator
-
-    prompt += "\n"
-
-
-    replies = text_generator(prompt, do_sample=True, top_k=50, top_p=0.95, max_new_tokens=500, return_full_text=False, num_return_sequences=1, repetition_penalty=1.05)[0]["generated_text"].split("\n")
-
-    #print (replies)
-    num_replies = min(len(replies), 5)
-
-    reply = ""
-
-    for i in range(num_replies):
-        if i == 0:
-            reply += replies[i] + "\n"
-        elif not replies[i].startswith("[INST]"):
-            reply += replies[i] + "\n"
-        else:
-            return reply.split("\n")
-
-    return reply.replace("Ball-E:", "")
-
-
 def gen_text_bloom_chat(prompt, input_ids, name):
     global text_generator
     #print (prompt)
@@ -611,7 +586,15 @@ def gen_text_bloom_chat(prompt, input_ids, name):
 
     reply = [""]
 
+    # Disallow eos-token at the start og generation. If not it is possible that Ball-E has no response.
+    settings.disallow_tokens(tokenizer, [tokenizer.eos_token_id])
+
     while True:
+
+        # Re-enable eos-token
+        if generated_tokens == 5:
+            settings.disallow_tokens(tokenizer, [])
+
         chunk, eos, _ = generator.stream()
         generated_tokens += 1
 
@@ -628,58 +611,6 @@ def gen_text_bloom_chat(prompt, input_ids, name):
     #print (prompt + reply)
 
     return reply[0]
-
-    for i in range(max_tokens//tokens_per_iter):
-        #continue
-#       print ("loop")
-        #input_ids = bloom_tokenizer(prompt, return_tensors="pt")["input_ids"].cuda()
-
-        #replies = bloom_tokenizer.decode(bloom_model.generate(input_ids,
-        #                    do_sample=True,
-        #                    top_k=50,
-        #                    top_p=0.95,
-        #                    max_new_tokens=tokens_per_iter,
-        #                    early_stopping=True,
-        #                    repetition_penalty=1.05)[0])
-
-        replies = generator.generate_simple(prompt, settings, tokens_per_iter)
-        if replies == last_replies:
-            break
-        
-
-        prompt = replies
-        replies = replies.split("\n")
-
-        for line in replies:
-            print (line)
-#        print ("===={}".format(replies[num_lines_prompt]))
-        if len(replies) > current_pointer:
-            if not replies[-1].startswith("[INST]"):
-                current_pointer += 1
-            else:
-                break
-
-        if replies[-1].startswith("[INST]"):
-            break
-
-    num_replies = min(len(replies)  - num_lines_prompt, 10)
-
-    reply = []
-
-    for i in range(num_replies):
-        if i == 0:
-            #reply += replies[num_lines_prompt + i - 1] + "\n"
-            reply.append(replies[num_lines_prompt + i])
-        elif not replies[num_lines_prompt + i].startswith("[INST]"):
-            #reply += replies[num_lines_prompt + i - 1] + "\n"
-            reply.append(replies[num_lines_prompt + i])
-        else:
-            print(reply)
-            return reply
-
-    print(reply)
-    return reply
-
 
 
 @client.command(name="gpt")
@@ -731,59 +662,8 @@ async def text_gpt(ctx, arg, max_length=50):
 
     running_text = False
 
-@client.command(name="bloom")
-async def text_bloom(ctx, arg, max_length=100):
-    global running_text
 
-    print ("{} requested a writing prompt of '{}'".format(ctx.message.author.mention, arg))
-
-
-    if running_text:
-        await ctx.reply("Another task is currently running, request has been queued...")
-        while running_text:
-            await asyncio.sleep(5)
-
-    running_text = True
-
-    await ctx.reply("Generating text, this might take some time...")
-
-    if max_length > 2000:
-        await ctx.reply("Maximum number of tokens has to be a number less than 2000")
-        max_length = 2000
-    
-    prompt = arg
-    assert prompt is not None
-
-    reply = None
-    loop = asyncio.get_event_loop()
-    #await loop.run_in_executor(ThreadPoolExecutor(), gen_text_bloom, ctx, prompt, max_length)
-#    reply = await loop.run_in_executor(ThreadPoolExecutor(), gen_text_bloom, ctx, prompt, max_length)
-    try:
-        reply = await loop.run_in_executor(ThreadPoolExecutor(), gen_text_bloom, ctx, prompt, max_length)
-        print ("lol")
-    except:
-        await ctx.reply("Something went wrong...")
-        running_text = False
-    
-
-    #reply = await loop.run_in_executor(ThreadPoolExecutor(), gen_text_gpt, ctx, prompt, max_length)
-    #reply = text_generator(prompt, do_sample=True, min_length=50)[0]["generated_text"]
-    
-    running_text = False
-
-    split_length = 1700
-
-    chunks = [str[i:i+n] for i in range(0, len(str), n)]
-
-    for reply in chunks:
-        await ctx.reply("```{}```".format(reply))
-
-#    running_text = False
-
-
-
-
-#@client.command(name="image")
+@client.command(name="image")
 async def image(ctx, arg, num_images=1, num_iter=opt.ddim_steps):
     global running_ai
 
