@@ -1,4 +1,5 @@
-#from diffusers import StableDiffusionPipeline, EulerDiscreteScheduler, StableDiffusionUpscalePipeline
+from diffusers import StableDiffusionPipeline, EulerDiscreteScheduler, StableDiffusionUpscalePipeline, DiffusionPipeline, DPMSolverMultistepScheduler
+from diffusers.utils import export_to_video
 import torch
 #import intel_extension_for_pytorch as ipex
 import argparse, os, sys, glob
@@ -81,7 +82,7 @@ parser.add_argument(
 parser.add_argument(
     "--ddim_steps",
     type=int,
-    default=45,
+    default=50,
     help="number of ddim sampling steps",
 )
 parser.add_argument(
@@ -114,13 +115,13 @@ parser.add_argument(
 parser.add_argument(
     "--H",
     type=int,
-    default=512,
+    default=1024,
     help="image height, in pixel space",
 )
 parser.add_argument(
     "--W",
     type=int,
-    default=512,
+    default=1024,
     help="image width, in pixel space",
 )
 parser.add_argument(
@@ -222,46 +223,82 @@ from exllamav2.generator import (
 
 import time
 
-# Initialize model and cache
+# Initialize llm-model and cache
 
+model = None
+tokenizer = None
+generator = None
+settings = None
+max_response_length = 512 # tokens
 model_init.add_args(parser)
 opt = parser.parse_args()
 model_init.check_args(opt)
 model_init.print_options(opt)
-model, tokenizer = model_init.init(opt)
 
-model_directory =  "/home/tuxinet/git/Llama2-13B-4.0bpw-h6-exl2/"
-model_directory = "/home/tuxinet/models/chimera-inst-chat-13b-gptq-4bit/"
-model_directory = "/home/tuxinet/models/Wizard-Vicuna-13B-Uncensored-GPTQ/"
-model_directory = "/home/tuxinet/models/CodeLlama-13B-instruct-2.65bpw-h6-exl2/"
+def load_text_model():
+    global model, tokenizer, generator
 
-max_response_length = 512 # tokens
+    model, tokenizer = model_init.init(opt)
+    
 
-cache = ExLlamaV2Cache(model)
 
-# Initialize generator
+    cache = ExLlamaV2Cache(model)
 
-generator = ExLlamaV2StreamingGenerator(model, cache, tokenizer)
+    # Initialize generator
 
-# Generate some text
+    generator = ExLlamaV2StreamingGenerator(model, cache, tokenizer)
 
-settings = ExLlamaV2Sampler.Settings()
-settings.temperature = 0.85
-settings.top_k = 50
-settings.top_p = 0.8
-settings.token_repetition_penalty = 1.15
-#settings.disallow_tokens(tokenizer, [tokenizer.eos_token_id])
+    # Generate some text
 
-generator.set_stop_conditions(["[INST]", "[/INST]", "[REPLY]", "[/REPLY]", tokenizer.eos_token_id])
-#generator.set_stop_conditions(["[INST]"])
+    settings = ExLlamaV2Sampler.Settings()
+    settings.temperature = 0.85
+    settings.top_k = 50
+    settings.top_p = 0.8
+    settings.token_repetition_penalty = 1.15
 
-generator.warmup()
+    generator.set_stop_conditions([tokenizer.eos_token_id])
 
-#device_map['model.decoder.layers.9'] = "cpu"
-#device_map['model.decoder.layers.10'] = "cpu"
-#device_map['model.decoder.layers.11'] = "cpu"
+    generator.warmup()
 
-#quantization_config = BitsAndBytesConfig(llm_int8_enable_fp32_cpu_offload=True)
+def unload_text_model():
+    global model, tokenizer, generator
+
+    generator = None
+    model = None
+    tokenizer = None
+
+    torch.cuda.empty_cache()
+
+
+
+# StableDiffusion setup
+sd_model_id = "CompVis/stable-diffusion-v1-4"
+sd_model_id = "stabilityai/stable-diffusion-xl-base-1.0"
+
+
+sd_pipe = None
+
+
+def load_sd_model():
+    global sd_pipe
+    sd_pipe = DiffusionPipeline.from_pretrained(sd_model_id,
+                                                variant="fp16", 
+                                                torch_dtype=torch.float16, 
+                                                use_auth_token="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", 
+                                                device_map="balanced_low_0",
+    )
+    
+    sd_pipe.enable_model_cpu_offload()
+
+def unload_sd_model():
+    global sd_pipe
+    sd_pipe = None
+
+    torch.cuda.empty_cache()
+
+
+# Refiner settings
+high_noise_frac = 0.8
 
 
 TOKEN = opt.token
@@ -293,7 +330,7 @@ async def on_ready():
 
 @client.event
 async def on_message(message):
-    global running_text
+    global running_text, running_ai
 
     name = "Ball-E"
     if message.author == client.user:
@@ -302,6 +339,7 @@ async def on_message(message):
     if message.content.startswith("!"): 
         await client.process_commands(message)
         return
+
 
 #    if message.content.startswith("---") and len(message.content) < 4:
 #        return
@@ -355,6 +393,20 @@ That is correct. What would you like for me to do?
     prompt = seed
     #prompt = "Ball-E is a sexually frustrated, right-winged extremist asshole\n---"
 
+    if not (type(message.channel) == discord.DMChannel and not message.content.startswith("!")) and not message.channel.name.startswith("ballechat"):
+        return
+
+    if running_ai:
+        while running_ai:
+            await asyncio.sleep(5)
+
+    running_ai = True
+
+    loop = asyncio.get_event_loop()
+    if generator is None:
+        unload_video_model()
+        await loop.run_in_executor(ThreadPoolExecutor(), load_text_model)
+
     messages = []
     async for m in message.channel.history(limit=100, oldest_first=True, around=datetime.datetime.now()):
         msg_fmt = ""
@@ -376,13 +428,6 @@ That is correct. What would you like for me to do?
 
     prompt = p
 
-
-    if running_text:
-        while running_text:
-            await asyncio.sleep(5)
-
-    running_text = True
-
     #print (message.channel.name)
 
     #await client.send_typing(message.channel)
@@ -392,7 +437,6 @@ That is correct. What would you like for me to do?
             async with message.channel.typing():
                 
                 reply = ""
-                loop = asyncio.get_event_loop()
                 
                 try:
                     # Sometimes it just generates whitespace
@@ -400,12 +444,12 @@ That is correct. What would you like for me to do?
                         reply = await loop.run_in_executor(ThreadPoolExecutor(), gen_text_bloom_chat, prompt, input_ids, name)
                         print (f"Length of reply is: {len(reply)} characters.")
                         seed_everything(np.random.randint(10000))
-                    running_text = False
+                    running_ai = False
                 except Exception as e:
                     # We crashed, free the mutex
                     print(e)
                     await message.channel.send("Something went wrong...")
-                    running_text = False
+                    running_ai = False
 
                 if reply is None:
                     reply = "lol"
@@ -436,10 +480,10 @@ That is correct. What would you like for me to do?
                         reply = await loop.run_in_executor(ThreadPoolExecutor(), gen_text_bloom_chat, prompt, input_ids, name)
                         seed_everything(np.random.randint(10000))
                         print (f"Length of reply is: {len(reply)} characters.")
-                    running_text = False
+                    running_ai = False
                 except Exception as e:
                     await message.channel.send("Something went wrong...")
-                    running_text = False
+                    running_ai = False
                     print(e)
 
                 if reply is None:
@@ -461,7 +505,7 @@ That is correct. What would you like for me to do?
         # We crashed, free the mutex
         print(e)
 
-    running_text = False
+    running_ai = False
 
 def get_tokenized_context(prompt, messages, max_len):
     # Has to have a newline to not crash with the prompt
@@ -507,55 +551,26 @@ def get_tokenized_context(prompt, messages, max_len):
 def gen_image(ctx, prompt, num_images, num_iter):
     global sd_pipe
     global running_ai
-    data = [batch_size * [prompt]]
 
+    image = sd_pipe(
+        prompt=prompt, 
+        num_inference_steps=num_iter,
+    ).images[0]
 
-    for n in trange(num_images, desc="Sampling"):
-        for prompt in tqdm(data, desc="data"):
-            #sd_pipe = StableDiffusionPipeline.from_pretrained(sd_model_id, scheduler=scheduler, revision="fp16", torch_dtype=torch.float16)
-            #sd_pipe = sd_pipe.to("cuda")
-            image = sd_pipe(prompt).images[0]
+    #image = refiner(
+    #    prompt=prompt,
+    #    num_inference_steps=num_iter,
+    #    denoising_start=high_noise_frac,
+    #    image=image,
+    #).images[0]
 
-            #del sd_pipe
+    if not opt.skip_save:
+        unique_id = uuid.uuid4()
+        image.save(os.path.join("/tmp/", f"{unique_id}.png"))
 
-            #up_pipe = StableDiffusionUpscalePipeline.from_pretrained(upscaler_model_id, revision="fp16", torch_dtype=torch.float16)
-            #up_pipe = up_pipe.to("cuda")
-            #upscaled_image = up_pipe(prompt=prompt, image=image).images[0]  
-
-            #del up_pipe
-
-            if not opt.skip_save:
-                unique_id = uuid.uuid4()
-                image.save(os.path.join("/tmp/", f"{unique_id}.png"))
-
-                # Send image
-                
-                return "/tmp/{}.png".format(unique_id)
-
-                #base_count += 1
-
-
-    try:
-
-        for n in trange(num_images, desc="Sampling"):
-            for prompt in tqdm(data, desc="data"):
-                image = sd_pipe(prompt).images[0]
-
-                upscaled_image = up_pipe(prompt=prompt, image=image).images[0]  
-
-                if not opt.skip_save:
-                    unique_id = uuid.uuid4()
-                    upscaled_image.save(os.path.join("/tmp/", f"{unique_id}.png"))
-
-                    # Send image
-                    
-                    return "/tmp/{}.png".format(unique_id)
-
-                    #base_count += 1
-    except Exception as e:
-        # We crashed, free the mutex
-        print(e)
-        running_ai = False
+        # Send image
+        
+        return "/tmp/{}.png".format(unique_id)
 
 
 def gen_text_gpt(ctx, prompt, max_length):
@@ -568,19 +583,9 @@ def gen_text_gpt(ctx, prompt, max_length):
 
 def gen_text_bloom_chat(prompt, input_ids, name):
     global text_generator
-    #print (prompt)
-
-    num_lines_prompt = len(prompt.split("\n")) - 1  # Prompt ends with Ball-E:, so we have to do a minus one to include if balle just does one answer
-    
-    # We want to keep on generating until the last line starts with [INST]
-    current_pointer = num_lines_prompt + 2
 
     max_tokens = max_response_length
-    tokens_per_iter = 5
-    replies = None
-    last_replies = None
     generated_tokens = 0
-
 
     generator.begin_stream(input_ids, settings)
 
@@ -665,7 +670,7 @@ async def text_gpt(ctx, arg, max_length=50):
 
 @client.command(name="image")
 async def image(ctx, arg, num_images=1, num_iter=opt.ddim_steps):
-    global running_ai
+    global running_ai, sd_pipe
 
     print("{} requested {} image(s) with prompt: \"{}\"".format(ctx.message.author.mention, num_images, arg))
 
@@ -675,6 +680,8 @@ async def image(ctx, arg, num_images=1, num_iter=opt.ddim_steps):
             await asyncio.sleep(5)
 
     running_ai = True
+
+
 
 
     await ctx.reply("Generating image with prompt: \"{}\"".format(arg))
@@ -691,30 +698,38 @@ async def image(ctx, arg, num_images=1, num_iter=opt.ddim_steps):
         num_iter = 100
         await ctx.reply("Maximum number of iterations is 100")
 
+    loop = asyncio.get_event_loop()
+    
+    if sd_pipe is None:
+        unload_video_model()
+        await loop.run_in_executor(ThreadPoolExecutor(), load_sd_model)
 
     unique_id = uuid.uuid4()
-    print ("Generating image with id: {}".format(uuid))
+    print ("Generating image with id: {}".format(str(uuid)))
 
     prompt = arg
     assert prompt is not None
-    loop = asyncio.get_event_loop()
 
     for _ in range(num_images):
 
         try:
             image_path = await loop.run_in_executor(ThreadPoolExecutor(), gen_image, ctx, prompt, 1, num_iter)
 
-        except:
+        except Exception as e:
             running_ai = False
             await ctx.reply("Something went wrong, aborting...")
+
+            print(e)
+
             return
 
         with open(image_path, "rb") as f:
             try:
                 picture = discord.File(f)
                 await ctx.reply(file=picture)
-            except:
+            except Exception as e:
                 print("Something went wrong, releasing mutex")
+                print (e)
                 running_ai = False
 
 
@@ -728,7 +743,115 @@ async def image(ctx, arg, num_images=1, num_iter=opt.ddim_steps):
 #        picture = discord.File(f)
 #        await ctx.reply(file=picture)
 
+video_pipe = None
+def load_video_model():
+    global video_pipe
+    # load pipeline
+    print ("loading video pipe")
 
+    video_pipe = DiffusionPipeline.from_pretrained("cerspense/zeroscope_v2_576w", torch_dtype=torch.float16, variant="fp16", device_map="sequential")
+    video_pipe.scheduler = DPMSolverMultistepScheduler.from_config(video_pipe.scheduler.config)
+
+    # optimize for GPU memory
+    video_pipe.enable_model_cpu_offload()
+    video_pipe.enable_vae_slicing()
+
+    print ("video pipe loaded")
+
+def unload_video_model():
+    global video_pipe
+
+    video_pipe = None
+
+    torch.cuda.empty_cache()
+
+
+def gen_video(prompt, num_frames, num_iter):
+    global video_pipe
+
+    video_frames = video_pipe(prompt, num_inference_steps=num_iter, num_frames=num_frames, width=576, height=320).frames
+
+    return export_to_video(video_frames)
+
+@client.command(name="video")
+async def video(ctx, arg, num_frames=24, num_iter=40):
+    global running_ai
+
+    print("{} requested video with prompt: \"{}\"".format(ctx.message.author.mention, arg))
+
+    if running_ai:
+        await ctx.reply("Another task is currently running, request has been queued...")
+        while running_ai:
+            await asyncio.sleep(5)
+
+    running_ai = True
+
+    await ctx.reply("Generating video with prompt: \"{}\"".format(arg))
+
+    # Start by unloading the sd_pipeline
+    unload_text_model()
+    unload_sd_model()
+    
+    loop = asyncio.get_event_loop()
+    if video_pipe is None:
+        await loop.run_in_executor(ThreadPoolExecutor(), load_video_model)
+
+
+
+
+    if num_iter <=0:
+        await ctx.reply("Number of iterations can't be less than or equal to 0")
+
+    if num_iter > 100:
+        num_iter = 100
+        await ctx.reply("Maximum number of iterations is 100")
+
+    if num_frames > 100:
+        num_frames = 100
+        await ctx.reply("Framecap is 100")
+
+    if num_frames <= 0:
+        await ctx.reply("Framecap has to be bigger than zero")
+        num_frames = 50
+
+
+    prompt = arg
+    assert prompt is not None
+
+    image_path = None
+
+    try:
+        image_path = await loop.run_in_executor(ThreadPoolExecutor(), gen_video, prompt, num_frames, num_iter)
+
+    except Exception as e:
+        await ctx.reply("Something went wrong, aborting...")
+
+        print(e)
+
+        running_ai = False
+
+        return
+
+    with open(image_path, "rb") as f:
+        try:
+            video = discord.File(f)
+            await ctx.reply(file=video)
+        except Exception as e:
+            print("Something went wrong, releasing mutex")
+            print (e)
+
+            running_ai = False
+
+
+
+    #gen_image(ctx, prompt, num_images, num_iter)
+
+    running_ai = False
+
+    # Reply with the generated image
+#    with open("/tmp/{}.png".format(unique_id), "rb") as f:
+#        picture = discord.File(f)
+#        await ctx.reply(file=picture)
 def main():
 
     print("Model loaded")
