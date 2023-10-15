@@ -1,4 +1,4 @@
-from diffusers import StableDiffusionPipeline, EulerDiscreteScheduler, StableDiffusionUpscalePipeline, DiffusionPipeline, DPMSolverMultistepScheduler
+from diffusers import StableDiffusionPipeline, EulerDiscreteScheduler, StableDiffusionUpscalePipeline, DiffusionPipeline, DPMSolverMultistepScheduler, AudioLDMPipeline
 from diffusers.utils import export_to_video
 import torch
 #import intel_extension_for_pytorch as ipex
@@ -13,7 +13,7 @@ from pytorch_lightning import seed_everything
 from torch import autocast
 from contextlib import contextmanager, nullcontext
 import datetime
-
+import scipy
 from transformers import AutoFeatureExtractor
 from transformers import pipeline
 
@@ -82,7 +82,7 @@ parser.add_argument(
 parser.add_argument(
     "--ddim_steps",
     type=int,
-    default=50,
+    default=55,
     help="number of ddim sampling steps",
 )
 parser.add_argument(
@@ -201,7 +201,7 @@ from transformers import AutoConfig, StoppingCriteria, StoppingCriteriaList
 # OpenAssistant/galactica-6.7b-finetuned
 
 model_name = "decapoda-research/llama-7b-hf"
-model_name = "meta-llama/Llama-2-7b-hf"
+model_name = "mistralai/Mistral-7B-v0.1"
 #model_name = "StabilityAI/stablelm-tuned-alpha-7b"
 
 import sys, os
@@ -225,10 +225,10 @@ import time
 
 # Initialize llm-model and cache
 
-model = None
-tokenizer = None
-generator = None
-settings = None
+model = [None]
+tokenizer = [None]
+generator = [None]
+settings = [None]
 max_response_length = 512 # tokens
 model_init.add_args(parser)
 opt = parser.parse_args()
@@ -238,34 +238,38 @@ model_init.print_options(opt)
 def load_text_model():
     global model, tokenizer, generator
 
-    model, tokenizer = model_init.init(opt)
+    model[0], tokenizer[0] = model_init.init(opt)
     
 
 
-    cache = ExLlamaV2Cache(model)
+    cache = ExLlamaV2Cache(model[0])
 
     # Initialize generator
 
-    generator = ExLlamaV2StreamingGenerator(model, cache, tokenizer)
+    generator[0] = ExLlamaV2StreamingGenerator(model[0], cache, tokenizer[0])
 
     # Generate some text
 
-    settings = ExLlamaV2Sampler.Settings()
-    settings.temperature = 0.85
-    settings.top_k = 50
-    settings.top_p = 0.8
-    settings.token_repetition_penalty = 1.15
+    settings[0] = ExLlamaV2Sampler.Settings()
+    settings[0].temperature = 0.4
+    settings[0].top_k = 150
+    settings[0].top_p = 0.9
+    settings[0].token_repetition_penalty = 1.15
 
-    generator.set_stop_conditions([tokenizer.eos_token_id])
+    generator[0].set_stop_conditions([tokenizer[0].eos_token_id, "[INST]", "[/INST]", "\n---\n"])
 
-    generator.warmup()
+    generator[0].warmup()
 
 def unload_text_model():
     global model, tokenizer, generator
 
-    generator = None
-    model = None
-    tokenizer = None
+    del generator[0]
+    del model[0]
+    del tokenizer[0]
+
+    generator.append(None)
+    model.append(None)
+    tokenizer.append(None)
 
     torch.cuda.empty_cache()
 
@@ -274,25 +278,28 @@ def unload_text_model():
 # StableDiffusion setup
 sd_model_id = "CompVis/stable-diffusion-v1-4"
 sd_model_id = "stabilityai/stable-diffusion-xl-base-1.0"
+#sd_model_id = "dreamlike-art/dreamlike-photoreal-2.0"
 
 
-sd_pipe = None
+sd_pipe = [None]
 
 
 def load_sd_model():
     global sd_pipe
-    sd_pipe = DiffusionPipeline.from_pretrained(sd_model_id,
+    sd_pipe[0] = DiffusionPipeline.from_pretrained(sd_model_id,
                                                 variant="fp16", 
                                                 torch_dtype=torch.float16, 
                                                 use_auth_token="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", 
                                                 device_map="balanced_low_0",
     )
     
-    sd_pipe.enable_model_cpu_offload()
+    sd_pipe[0].enable_model_cpu_offload()
 
 def unload_sd_model():
     global sd_pipe
-    sd_pipe = None
+    del sd_pipe[0]
+
+    sd_pipe.append(None)
 
     torch.cuda.empty_cache()
 
@@ -403,7 +410,7 @@ That is correct. What would you like for me to do?
     running_ai = True
 
     loop = asyncio.get_event_loop()
-    if generator is None:
+    if generator[0] is None:
         unload_video_model()
         await loop.run_in_executor(ThreadPoolExecutor(), load_text_model)
 
@@ -419,7 +426,7 @@ That is correct. What would you like for me to do?
             else: #husk m.author.name
                 msg_fmt = "\n[INST] {}: {} [/INST]".format(m.author.name, m.content)
         else:
-            msg_fmt = "\n{}".format(m.content)
+            msg_fmt = "\n{}: {}".format(name, m.content)
         
         messages.append(msg_fmt)
     
@@ -524,13 +531,13 @@ def get_tokenized_context(prompt, messages, max_len):
         for item in chat:
             chat_str += item
 
-            input_ids = tokenizer.encode(chat_str)
+            input_ids = tokenizer[0].encode(chat_str)
 
             if input_ids.shape[-1] < max_len:
                 continue
             else:
                 chat_str += "\n"
-                input_ids = tokenizer.encode(chat_str)
+                input_ids = tokenizer[0].encode(chat_str)
                 return input_ids, chat_str
     
     # Construct final result
@@ -538,9 +545,9 @@ def get_tokenized_context(prompt, messages, max_len):
     for item in chat:
         chat_str += item
 
-    chat_str += "\n"
+    chat_str += "\nBall-E:"
     
-    input_ids = tokenizer.encode(chat_str)
+    input_ids = tokenizer[0].encode(chat_str)
 
     #print(chat_str)
     
@@ -548,13 +555,17 @@ def get_tokenized_context(prompt, messages, max_len):
 
 
 
-def gen_image(ctx, prompt, num_images, num_iter):
+def gen_image(ctx, prompt, negative_prompt, num_images, num_iter):
     global sd_pipe
     global running_ai
 
-    image = sd_pipe(
+    # 1344 x 768
+    image = sd_pipe[0](
         prompt=prompt, 
+        negative_prompt=negative_prompt,
         num_inference_steps=num_iter,
+        width=1344,
+        height=768,
     ).images[0]
 
     #image = refiner(
@@ -587,20 +598,20 @@ def gen_text_bloom_chat(prompt, input_ids, name):
     max_tokens = max_response_length
     generated_tokens = 0
 
-    generator.begin_stream(input_ids, settings)
+    generator[0].begin_stream(input_ids, settings[0])
 
     reply = [""]
 
     # Disallow eos-token at the start og generation. If not it is possible that Ball-E has no response.
-    settings.disallow_tokens(tokenizer, [tokenizer.eos_token_id])
+    settings[0].disallow_tokens(tokenizer[0], [tokenizer[0].eos_token_id])
 
     while True:
 
         # Re-enable eos-token
         if generated_tokens == 5:
-            settings.disallow_tokens(tokenizer, [])
+            settings[0].disallow_tokens(tokenizer[0], [])
 
-        chunk, eos, _ = generator.stream()
+        chunk, eos, _ = generator[0].stream()
         generated_tokens += 1
 
         reply[0] += chunk
@@ -669,7 +680,7 @@ async def text_gpt(ctx, arg, max_length=50):
 
 
 @client.command(name="image")
-async def image(ctx, arg, num_images=1, num_iter=opt.ddim_steps):
+async def image(ctx, arg, negative_prompt="", num_images=1, num_iter=opt.ddim_steps):
     global running_ai, sd_pipe
 
     print("{} requested {} image(s) with prompt: \"{}\"".format(ctx.message.author.mention, num_images, arg))
@@ -699,9 +710,9 @@ async def image(ctx, arg, num_images=1, num_iter=opt.ddim_steps):
         await ctx.reply("Maximum number of iterations is 100")
 
     loop = asyncio.get_event_loop()
+    unload_video_model()
     
-    if sd_pipe is None:
-        unload_video_model()
+    if sd_pipe[0] is None:
         await loop.run_in_executor(ThreadPoolExecutor(), load_sd_model)
 
     unique_id = uuid.uuid4()
@@ -713,7 +724,7 @@ async def image(ctx, arg, num_images=1, num_iter=opt.ddim_steps):
     for _ in range(num_images):
 
         try:
-            image_path = await loop.run_in_executor(ThreadPoolExecutor(), gen_image, ctx, prompt, 1, num_iter)
+            image_path = await loop.run_in_executor(ThreadPoolExecutor(), gen_image, ctx, prompt, negative_prompt, 1, num_iter)
 
         except Exception as e:
             running_ai = False
@@ -743,35 +754,70 @@ async def image(ctx, arg, num_images=1, num_iter=opt.ddim_steps):
 #        picture = discord.File(f)
 #        await ctx.reply(file=picture)
 
-video_pipe = None
+audio_pipe = [None]
+def load_audio_model():
+    global audio_pipe
+    repo_id = "cvssp/audioldm-s-full-v2"
+    audio_pipe[0] = AudioLDMPipeline.from_pretrained(repo_id, torch_dtype=torch.float16)
+    audio_pipe[0] = audio_pipe[0].to("cuda")
+
+def unload_audio_model():
+    global audio_pipe
+
+    del audio_pipe[0]
+    audio_pipe.append(None)
+
+    torch.cuda.empty_cache()
+
+video_pipe = [None]
 def load_video_model():
     global video_pipe
     # load pipeline
     print ("loading video pipe")
 
-    video_pipe = DiffusionPipeline.from_pretrained("cerspense/zeroscope_v2_576w", torch_dtype=torch.float16, variant="fp16", device_map="sequential")
-    video_pipe.scheduler = DPMSolverMultistepScheduler.from_config(video_pipe.scheduler.config)
+    video_pipe[0] = DiffusionPipeline.from_pretrained("cerspense/zeroscope_v2_576w", torch_dtype=torch.float16, variant="fp16", device_map="sequential")
+    video_pipe[0].scheduler = DPMSolverMultistepScheduler.from_config(video_pipe[0].scheduler.config)
 
     # optimize for GPU memory
-    video_pipe.enable_model_cpu_offload()
-    video_pipe.enable_vae_slicing()
+    video_pipe[0].enable_model_cpu_offload()
+    video_pipe[0].enable_vae_slicing()
 
     print ("video pipe loaded")
 
 def unload_video_model():
     global video_pipe
 
-    video_pipe = None
+    del video_pipe[0]
+    video_pipe.append(None)
+
+    unload_audio_model()
 
     torch.cuda.empty_cache()
 
 
+
+
 def gen_video(prompt, num_frames, num_iter):
-    global video_pipe
+    global video_pipe, audio_pipe
 
-    video_frames = video_pipe(prompt, num_inference_steps=num_iter, num_frames=num_frames, width=576, height=320).frames
+    video_frames = video_pipe[0](prompt, num_inference_steps=num_iter, num_frames=num_frames, width=576, height=320).frames
 
-    return export_to_video(video_frames)
+    vPath = export_to_video(video_frames)
+
+    audio = audio_pipe[0](prompt, num_inference_steps=10, audio_length_in_s=num_frames//8).audios[0]
+
+    aPath = vPath + '-audio.wav'
+
+    scipy.io.wavfile.write(aPath, rate=16000, data=audio)
+
+    os.system(f"ffmpeg -i {vPath} -vcodec libx264 {vPath+'-encode'}.mp4")
+
+    os.system(f"ffmpeg -i {vPath + '-encode.mp4'} -i {aPath} -c:v copy -map 0:v:0 -map 1:a:0 -c:a aac -b:a 64k {vPath+'-combined.mp4'}")
+
+    # Now add audio
+
+    return vPath + '-combined.mp4'
+    # ffmpeg -i input.flv -vcodec libx264 -acodec aac output.mp4
 
 @client.command(name="video")
 async def video(ctx, arg, num_frames=24, num_iter=40):
@@ -793,8 +839,9 @@ async def video(ctx, arg, num_frames=24, num_iter=40):
     unload_sd_model()
     
     loop = asyncio.get_event_loop()
-    if video_pipe is None:
+    if video_pipe[0] is None:
         await loop.run_in_executor(ThreadPoolExecutor(), load_video_model)
+        await loop.run_in_executor(ThreadPoolExecutor(), load_audio_model)
 
 
 
